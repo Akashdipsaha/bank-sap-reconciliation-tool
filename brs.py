@@ -426,7 +426,6 @@ class Processor:
                         bank.at[idx, "is_matched"] = True
                         sap.at[i, "status"] = "100% Matched"
                         sap.at[i, "Match_Method"] = "Ref ID"
-                        # NEW: Capture Bank Reference
                         if self.orig_bank_ref_col:
                             sap.at[i, f"Bank_{self.orig_bank_ref_col}"] = bank.loc[idx, self.orig_bank_ref_col]
                         continue
@@ -440,7 +439,6 @@ class Processor:
                     bank.at[idx, "is_matched"] = True
                     sap.at[i, "status"] = "100% Matched"
                     sap.at[i, "Match_Method"] = "Exact Date"
-                    # NEW: Capture Bank Reference
                     if self.orig_bank_ref_col:
                         sap.at[i, f"Bank_{self.orig_bank_ref_col}"] = bank.loc[idx, self.orig_bank_ref_col]
                     continue
@@ -457,10 +455,8 @@ class Processor:
                         best = valid.sort_values("_diff").index[0]
                         idx = valid.sort_values("_diff").index[0]
                         bank.at[idx, "is_matched"] = True
-                        # RENAMED: 'Multiple Matches (Check Date)' to 'Soft Match'
                         sap.at[i, "status"] = "Soft Match" 
                         sap.at[i, "Match_Method"] = f"Date Diff {valid.loc[best, '_diff']} days"
-                        # NEW: Capture Bank Reference
                         if self.orig_bank_ref_col:
                             sap.at[i, f"Bank_{self.orig_bank_ref_col}"] = bank.loc[idx, self.orig_bank_ref_col]
                         continue
@@ -472,7 +468,6 @@ class Processor:
                 bank.at[idx, "is_matched"] = True
                 sap.at[i, "status"] = "Matched (Amount Only)" 
                 sap.at[i, "Match_Method"] = "Amount Only"
-                # NEW: Capture Bank Reference
                 if self.orig_bank_ref_col:
                     sap.at[i, f"Bank_{self.orig_bank_ref_col}"] = bank.loc[idx, self.orig_bank_ref_col]
 
@@ -484,60 +479,75 @@ class Processor:
                 "status": "Not Found in SAP Record", 
                 "Match_Method": "Bank Only"
             })
-            # --- DATE MAPPING FIX: Map Bank 'Date' to SAP Date column name for sorting ---
+            # Map Bank 'Date' to SAP Date column name
             target_date_col = self.sap_date_col if (self.sap_date_col and self.sap_date_col in sap.columns) else "Date"
             
             if self.bank_date_col and "Date" in unmatched.columns:
                  extra[target_date_col] = unmatched["Date"]
             
-            # NEW: If SAP Ref exists, add its column to the "Bank Only" records, and populate it with the Bank Ref
             if self.orig_sap_ref_col:
-                 extra[self.orig_sap_ref_col] = np.nan # SAP ref is empty for bank only records
+                 extra[self.orig_sap_ref_col] = np.nan
             
-            # NEW: Add Bank Ref column to "Bank Only" records, populated with Bank Ref
             if self.orig_bank_ref_col: 
                  extra[f"Bank_{self.orig_bank_ref_col}"] = unmatched[self.orig_bank_ref_col]
             
             sap = pd.concat([sap, extra], ignore_index=True)
             
         if "_clean_ref" in sap.columns: sap.drop(columns=["_clean_ref"], inplace=True)
-        self.final = sap
         
-        # FINAL COLUMN REORDERING FOR READABILITY
-        final_cols = list(self.final.columns)
+        # --- 1. SORTING & SERIAL NUMBERS (Before Reordering) ---
         
-        # Prioritize Amount and Status near the start
-        priority_cols = [col_amt, "status", "Match_Method"]
+        # Identify Key Columns
+        date_col = self.sap_date_col if (self.sap_date_col and self.sap_date_col in sap.columns) else "Date"
+        type_col = self.sap_type_col if (self.sap_type_col and self.sap_type_col in sap.columns) else "Txn_Type"
         
-        # Include original SAP and Bank Reference columns
-        if self.orig_sap_ref_col: priority_cols.insert(1, self.orig_sap_ref_col)
-        if self.orig_bank_ref_col: priority_cols.insert(2, f"Bank_{self.orig_bank_ref_col}")
-
-        # Remove priority columns from the rest of the list
-        for col in priority_cols:
-            if col in final_cols: final_cols.remove(col)
+        # Sort Chronologically
+        if date_col in sap.columns:
+            sap[date_col] = pd.to_datetime(sap[date_col], errors='coerce')
+            sap.sort_values(by=date_col, ascending=True, inplace=True, na_position='last')
         
-        # Combine and apply new column order
-        new_order = priority_cols + final_cols
+        # Add S.No.
+        sap.reset_index(drop=True, inplace=True)
+        sap.insert(0, "S.No.", sap.index + 1)
         
-        # Remove any duplicates or non-existent columns from the final order list
-        final_order = [c for c in new_order if c in self.final.columns]
+        # --- 2. SPECIFIC COLUMN REORDERING ---
+        # Requirement: [S.No.] -> [Date] -> ... -> [Match_Method] -> [Credit/Debit]
         
-        self.final = self.final[final_order]
-
-        # --- UPDATE: SORT DATE SERIAL WISE & ADD SERIAL NO ---
+        all_cols = list(sap.columns)
+        new_order = ["S.No."]
         
-        # 1. Sort by Date
-        sort_date_col = self.sap_date_col if (self.sap_date_col and self.sap_date_col in self.final.columns) else "Date"
-        if sort_date_col in self.final.columns:
-            # Ensure it's datetime
-            self.final[sort_date_col] = pd.to_datetime(self.final[sort_date_col], errors='coerce')
-            self.final.sort_values(by=sort_date_col, ascending=True, inplace=True, na_position='last')
+        # Add Date (Second Position)
+        if date_col in all_cols and date_col not in new_order:
+            new_order.append(date_col)
+            
+        # Add References and Amount (Logic: Keep them visible early on)
+        if self.orig_sap_ref_col and self.orig_sap_ref_col in all_cols and self.orig_sap_ref_col not in new_order:
+            new_order.append(self.orig_sap_ref_col)
         
-        # 2. Add Serial Number (S.No.) at the Start for user friendliness
-        self.final.reset_index(drop=True, inplace=True)
-        self.final.insert(0, "S.No.", self.final.index + 1)
-
+        if self.orig_bank_ref_col:
+            bank_ref_key = f"Bank_{self.orig_bank_ref_col}"
+            if bank_ref_key in all_cols and bank_ref_key not in new_order:
+                 new_order.append(bank_ref_key)
+        
+        if col_amt in all_cols and col_amt not in new_order:
+            new_order.append(col_amt)
+            
+        if "status" in all_cols and "status" not in new_order:
+            new_order.append("status")
+            
+        # Add Match Method
+        if "Match_Method" in all_cols and "Match_Method" not in new_order:
+            new_order.append("Match_Method")
+            
+        # Add Credit/Debit (Immediately after Match_Method)
+        if type_col in all_cols and type_col not in new_order:
+            new_order.append(type_col)
+            
+        # Add Remaining Columns
+        remaining = [c for c in all_cols if c not in new_order]
+        new_order.extend(remaining)
+        
+        self.final = sap[new_order]
 
     def excel(self):
         buf = BytesIO()
@@ -561,7 +571,6 @@ class Processor:
                 for r in range(2, ws.max_row + 1):
                     val = str(ws.cell(r, col_idx).value or "").lower()
                     if "100%" in val: ws.cell(r, col_idx).fill = green
-                    # NEW: Check for 'soft match'
                     elif "soft match" in val: ws.cell(r, col_idx).fill = orange
                     elif "amount only" in val: ws.cell(r, col_idx).fill = blue_light
                     elif "bank" in val: ws.cell(r, col_idx).fill = red
@@ -572,9 +581,8 @@ class Processor:
             s_ws["A1"] = "RECONCILIATION SUMMARY"; s_ws["A1"].font = Font(bold=True, size=14)
             s_ws["A3"] = f"Total Records: {len(self.final)}"
             
-            # NEW: Update summary logic for 'Soft Match'
             df_exact = self.final[self.final["status"] == "100% Matched"]
-            df_soft = self.final[self.final["status"] == "Soft Match"] # Use 'Soft Match'
+            df_soft = self.final[self.final["status"] == "Soft Match"]
             df_amount = self.final[self.final["status"].str.contains("Amount Only", na=False)]
             df_unmatched = self.final[self.final["status"].str.contains("Not Found", na=False)]
             
@@ -645,7 +653,6 @@ with col_results:
                         st.session_state.excel_buffer = p.excel()
                         st.session_state.metrics = {
                             "matched": (p.final["status"] == "100% Matched").sum(),
-                            # NEW: Use 'Soft Match' for metrics
                             "soft": (p.final["status"] == "Soft Match").sum(),
                             "amount_only": (p.final["status"].str.contains("Amount Only")).sum(),
                             "notfound": (p.final["status"].str.contains("Not Found")).sum()
@@ -666,7 +673,6 @@ with col_results:
         m = st.session_state.metrics
         c1, c2, c3, c4 = st.columns(4)
         
-        # --- ADDED HELP TOOLTIPS HERE ---
         c1.metric("✅ Exact", m["matched"], help="Perfect match found using Reference ID OR (Exact Date + Amount).")
         c2.metric("🟠 Soft Date", m["soft"], help="Amount matches, but Date differs by up to ±3 days.")
         c3.metric("🔵 Amount Only", m["amount_only"], help="Amount matches exactly, but Date differs by more than 3 days (or Date missing).")
