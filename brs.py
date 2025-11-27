@@ -163,8 +163,8 @@ div.stButton > button.reset-btn {
 # ----------------------------------------------------
 st.markdown("""
 <div class='app-header'>
-  <h2>🏦 Automated Bank Reconciliation System</h2>
-  <p>Secure, Reliable & One-Stop Solution for Bank-to-SAP Ledger Matching</p>
+    <h2>🏦 Automated Bank Reconciliation System</h2>
+    <p>Secure, Reliable & One-Stop Solution for Bank-to-SAP Ledger Matching</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -188,6 +188,8 @@ class Processor:
         self.orig_bank_ref_col = None 
         self.orig_sap_ref_col = None
         self.sap_date_name = None # To store the original date column name of SAP
+        # NEW: Store original Bank Narration/Description column for "Bank Only" records
+        self.orig_bank_narration_col = None 
 
     def clean_currency(self, series):
         if series.dtype == 'object':
@@ -257,8 +259,8 @@ class Processor:
                 df.rename(columns={col: "Date"}, inplace=True)
                 break
         
-        # Reference
-        ref_keywords = ["chq./ref.no.", "cheque no", "ref no", "reference", "narration", "description", "tran id", "remarks", "chqno", "particulars"]
+        # Reference (for matching - tends to be chq/ref no)
+        ref_keywords = ["chq./ref.no.", "cheque no", "ref no", "reference", "tran id", "chqno"]
         for col, lower_col in col_map.items():
             if any(k in lower_col for k in ref_keywords):
                 self.bank_ref_col = col
@@ -266,6 +268,19 @@ class Processor:
                 self.orig_bank_ref_col = col 
                 break
 
+        # Narration/Description (for manual review - tends to be more descriptive)
+        narration_keywords = ["narration", "description", "remarks", "particulars", "details", "comments"]
+        for col, lower_col in col_map.items():
+            if any(k in lower_col for k in narration_keywords):
+                self.orig_bank_narration_col = col
+                break
+
+        # If a specific ref column wasn't found, use the narration column for matching if available.
+        if not self.orig_bank_ref_col and self.orig_bank_narration_col:
+            self.bank_ref_col = self.orig_bank_narration_col
+            self.orig_bank_ref_col = self.orig_bank_narration_col
+        # NOTE: Even if narration is used for matching, we still want to keep it in the output.
+        
         # --- 3. IDENTIFY AMOUNT & TYPE (THE FIX) ---
         
         w_col = None # Withdrawal / Debit
@@ -396,6 +411,10 @@ class Processor:
         if self.orig_bank_ref_col and self.orig_bank_ref_col in bank.columns:
             sap[f"Bank_{self.orig_bank_ref_col}"] = np.nan 
 
+        # NEW: Create a new column in SAP to hold the matching Bank Narration/Description
+        if self.orig_bank_narration_col and self.orig_bank_narration_col in bank.columns:
+            sap[f"Bank_{self.orig_bank_narration_col}"] = np.nan 
+        
         if self.sap_ref_col and self.bank_ref_col:
             sap["_clean_ref"] = self.clean_ref(sap[self.sap_ref_col])
             bank["_clean_ref"] = self.clean_ref(bank[self.bank_ref_col])
@@ -435,6 +454,9 @@ class Processor:
                         sap.at[i, "Match_Method"] = "Ref ID"
                         if self.orig_bank_ref_col:
                             sap.at[i, f"Bank_{self.orig_bank_ref_col}"] = bank.loc[idx, self.orig_bank_ref_col]
+                        # NEW: Capture Bank Narration
+                        if self.orig_bank_narration_col:
+                            sap.at[i, f"Bank_{self.orig_bank_narration_col}"] = bank.loc[idx, self.orig_bank_narration_col]
                         continue
 
             # PASS 2: Exact Date
@@ -449,6 +471,9 @@ class Processor:
                     sap.at[i, "Match_Method"] = "Exact Date"
                     if self.orig_bank_ref_col:
                         sap.at[i, f"Bank_{self.orig_bank_ref_col}"] = bank.loc[idx, self.orig_bank_ref_col]
+                    # NEW: Capture Bank Narration
+                    if self.orig_bank_narration_col:
+                        sap.at[i, f"Bank_{self.orig_bank_narration_col}"] = bank.loc[idx, self.orig_bank_narration_col]
                     continue
 
             # PASS 3: Soft Date
@@ -468,6 +493,9 @@ class Processor:
                         sap.at[i, "Match_Method"] = f"Date Diff {valid.loc[best, '_diff']} days"
                         if self.orig_bank_ref_col:
                             sap.at[i, f"Bank_{self.orig_bank_ref_col}"] = bank.loc[idx, self.orig_bank_ref_col]
+                        # NEW: Capture Bank Narration
+                        if self.orig_bank_narration_col:
+                            sap.at[i, f"Bank_{self.orig_bank_narration_col}"] = bank.loc[idx, self.orig_bank_narration_col]
                         continue
 
             # PASS 4: Amount Only
@@ -480,6 +508,9 @@ class Processor:
                 sap.at[i, "Match_Method"] = "Amount Only"
                 if self.orig_bank_ref_col:
                     sap.at[i, f"Bank_{self.orig_bank_ref_col}"] = bank.loc[idx, self.orig_bank_ref_col]
+                # NEW: Capture Bank Narration
+                if self.orig_bank_narration_col:
+                    sap.at[i, f"Bank_{self.orig_bank_narration_col}"] = bank.loc[idx, self.orig_bank_narration_col]
 
         # Handle Leftovers (Bank Only)
         unmatched = bank[bank["is_matched"]==False].copy()
@@ -500,8 +531,12 @@ class Processor:
                  extra[self.orig_sap_ref_col] = np.nan 
             
             # Bank Ref column (populated)
-            if self.orig_bank_ref_col: 
+            if self.orig_bank_ref_col and self.orig_bank_ref_col in unmatched.columns: 
                  extra[f"Bank_{self.orig_bank_ref_col}"] = unmatched[self.orig_bank_ref_col]
+
+            # NEW: Bank Narration column (populated)
+            if self.orig_bank_narration_col and self.orig_bank_narration_col in unmatched.columns: 
+                 extra[f"Bank_{self.orig_bank_narration_col}"] = unmatched[self.orig_bank_narration_col]
             
             # SAP Debit/Credit Type
             if self.sap_type_col:
@@ -527,6 +562,9 @@ class Processor:
         ref_cols = []
         if self.orig_sap_ref_col: ref_cols.append(self.orig_sap_ref_col)
         if self.orig_bank_ref_col: ref_cols.append(f"Bank_{self.orig_bank_ref_col}")
+        # NEW: Include Bank Narration column here
+        if self.orig_bank_narration_col and f"Bank_{self.orig_bank_narration_col}" in self.final.columns: 
+            ref_cols.append(f"Bank_{self.orig_bank_narration_col}")
         
         # Remove priority/ref columns from the rest of the list
         for col in [date_col_name] + priority_cols + ref_cols:
@@ -624,7 +662,7 @@ with col_inputs:
             st.error(f"Error reading sheets: {e}")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown('<div class="upload-card"><div class="card-header">💼 SAP Statement (Ensure D/C Column is Present)</div>', unsafe_allow_html=True)
+    st.markdown('<div class="upload-card"><div class="card-header">💼 SAP Statement</div>', unsafe_allow_html=True)
     sap_file = st.file_uploader("Upload SAP File", type=["xlsx", "xls", "csv"], key="sap_up", label_visibility="collapsed")
     st.markdown("</div>", unsafe_allow_html=True)
 
