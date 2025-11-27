@@ -163,8 +163,8 @@ div.stButton > button.reset-btn {
 # ----------------------------------------------------
 st.markdown("""
 <div class='app-header'>
-    <h2>🏦 Automated Bank Reconciliation System</h2>
-    <p>Secure, Reliable & One-Stop Solution for Bank-to-SAP Ledger Matching</p>
+  <h2>🏦 Automated Bank Reconciliation System</h2>
+  <p>Secure, Reliable & One-Stop Solution for Bank-to-SAP Ledger Matching</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -187,9 +187,6 @@ class Processor:
         # NEW: Store original reference column names for final output
         self.orig_bank_ref_col = None 
         self.orig_sap_ref_col = None
-        self.sap_date_name = None # To store the original date column name of SAP
-        # NEW: Store original Bank Narration/Description column for "Bank Only" records
-        self.orig_bank_narration_col = None 
 
     def clean_currency(self, series):
         if series.dtype == 'object':
@@ -259,8 +256,8 @@ class Processor:
                 df.rename(columns={col: "Date"}, inplace=True)
                 break
         
-        # Reference (for matching - tends to be chq/ref no)
-        ref_keywords = ["chq./ref.no.", "cheque no", "ref no", "reference", "tran id", "chqno"]
+        # Reference
+        ref_keywords = ["chq./ref.no.", "cheque no", "ref no", "reference", "narration", "description", "tran id", "remarks", "chqno", "particulars"]
         for col, lower_col in col_map.items():
             if any(k in lower_col for k in ref_keywords):
                 self.bank_ref_col = col
@@ -268,19 +265,6 @@ class Processor:
                 self.orig_bank_ref_col = col 
                 break
 
-        # Narration/Description (for manual review - tends to be more descriptive)
-        narration_keywords = ["narration", "description", "remarks", "particulars", "details", "comments"]
-        for col, lower_col in col_map.items():
-            if any(k in lower_col for k in narration_keywords):
-                self.orig_bank_narration_col = col
-                break
-
-        # If a specific ref column wasn't found, use the narration column for matching if available.
-        if not self.orig_bank_ref_col and self.orig_bank_narration_col:
-            self.bank_ref_col = self.orig_bank_narration_col
-            self.orig_bank_ref_col = self.orig_bank_narration_col
-        # NOTE: Even if narration is used for matching, we still want to keep it in the output.
-        
         # --- 3. IDENTIFY AMOUNT & TYPE (THE FIX) ---
         
         w_col = None # Withdrawal / Debit
@@ -381,7 +365,6 @@ class Processor:
         for c in self.df2.columns:
             if "date" in c.lower() and "doc" not in c.lower(): 
                 self.sap_date_col = c
-                self.sap_date_name = c # Store original name
                 self.df2[c] = pd.to_datetime(self.df2[c], dayfirst=True, errors='coerce')
                 break
 
@@ -395,8 +378,6 @@ class Processor:
         
         # Find SAP Debit/Credit
         self.sap_type_col = next((c for c in self.df2.columns if "debit" in c.lower() and "credit" in c.lower()), None)
-        if not self.sap_type_col:
-            raise ValueError("Missing Debit/Credit indicator column in SAP file. Cannot determine transaction direction.")
 
     def match(self):
         bank = self.df.copy().reset_index(drop=True)
@@ -407,14 +388,11 @@ class Processor:
         sap["Match_Method"] = ""
         bank["is_matched"] = False
         
-        # Create a new column in SAP to hold the matching Bank Reference
+        # NEW: Create a new column in SAP to hold the matching Bank Reference
+        # Ensure Bank Reference column exists before attempting to access
         if self.orig_bank_ref_col and self.orig_bank_ref_col in bank.columns:
             sap[f"Bank_{self.orig_bank_ref_col}"] = np.nan 
 
-        # NEW: Create a new column in SAP to hold the matching Bank Narration/Description
-        if self.orig_bank_narration_col and self.orig_bank_narration_col in bank.columns:
-            sap[f"Bank_{self.orig_bank_narration_col}"] = np.nan 
-        
         if self.sap_ref_col and self.bank_ref_col:
             sap["_clean_ref"] = self.clean_ref(sap[self.sap_ref_col])
             bank["_clean_ref"] = self.clean_ref(bank[self.bank_ref_col])
@@ -422,22 +400,19 @@ class Processor:
         # --- MATCHING LOOP ---
         for i, row in sap.iterrows():
             amt = row[col_amt]
-            if pd.isna(amt) or amt <= 0: continue
+            if pd.isna(amt): continue
             
-            # --- 1. DIRECTIONAL LOGIC (INCOMING/OUTGOING) ---
-            # SAP 'H' (Credit) matches Bank 'Dr' (Withdrawal/Outgoing)
-            # SAP 'S' (Debit) matches Bank 'Cr' (Deposit/Incoming)
+            # Directional Logic
             target_type = None
-            sap_ind = str(row[self.sap_type_col]).strip().upper()
-            if sap_ind == 'H': 
-                target_type = 'Dr' 
-            elif sap_ind == 'S': 
-                target_type = 'Cr' 
+            if self.sap_type_col:
+                sap_ind = str(row[self.sap_type_col]).strip().upper()
+                if sap_ind == 'H': target_type = 'Dr' # SAP Credit -> Bank Withdrawal
+                elif sap_ind == 'S': target_type = 'Cr' # SAP Debit -> Bank Deposit
+            
+            if target_type:
+                bank_candidates = bank[(bank['Txn_Type'] == target_type) & (bank["is_matched"] == False)]
             else:
-                # If indicator is not H/S, skip matching this row
-                continue
-
-            bank_candidates = bank[(bank['Txn_Type'] == target_type) & (bank["is_matched"] == False)]
+                bank_candidates = bank[bank["is_matched"] == False]
             
             if bank_candidates.empty: continue
 
@@ -445,72 +420,61 @@ class Processor:
             if self.sap_ref_col and self.bank_ref_col:
                 ref = row["_clean_ref"]
                 if ref and len(str(ref)) > 2:
-                    # Must match direction and amount
-                    cand = bank_candidates[(bank_candidates["_clean_ref"]==ref) & (bank_candidates["Amount"]==amt)] 
+                    cand = bank_candidates[(bank_candidates["_clean_ref"]==ref) & (bank_candidates["Amount"]==amt)]
                     if not cand.empty:
                         idx = cand.index[0]
                         bank.at[idx, "is_matched"] = True
                         sap.at[i, "status"] = "100% Matched"
                         sap.at[i, "Match_Method"] = "Ref ID"
+                        # NEW: Capture Bank Reference
                         if self.orig_bank_ref_col:
                             sap.at[i, f"Bank_{self.orig_bank_ref_col}"] = bank.loc[idx, self.orig_bank_ref_col]
-                        # NEW: Capture Bank Narration
-                        if self.orig_bank_narration_col:
-                            sap.at[i, f"Bank_{self.orig_bank_narration_col}"] = bank.loc[idx, self.orig_bank_narration_col]
                         continue
 
             # PASS 2: Exact Date
             if self.sap_date_col and self.bank_date_col and not pd.isna(row[self.sap_date_col]):
                 s_date = row[self.sap_date_col]
-                # Must match direction and amount
                 cand = bank_candidates[(bank_candidates["Amount"]==amt) & (bank_candidates["Date"]==s_date)]
                 if not cand.empty:
                     idx = cand.index[0]
                     bank.at[idx, "is_matched"] = True
                     sap.at[i, "status"] = "100% Matched"
                     sap.at[i, "Match_Method"] = "Exact Date"
+                    # NEW: Capture Bank Reference
                     if self.orig_bank_ref_col:
                         sap.at[i, f"Bank_{self.orig_bank_ref_col}"] = bank.loc[idx, self.orig_bank_ref_col]
-                    # NEW: Capture Bank Narration
-                    if self.orig_bank_narration_col:
-                        sap.at[i, f"Bank_{self.orig_bank_narration_col}"] = bank.loc[idx, self.orig_bank_narration_col]
                     continue
 
             # PASS 3: Soft Date
             if self.sap_date_col and self.bank_date_col and not pd.isna(row[self.sap_date_col]):
                 s_date = row[self.sap_date_col]
-                # Filter candidates by amount and direction first
-                cand = bank_candidates[bank_candidates["Amount"]==amt].copy()
-                
+                cand = bank_candidates[bank_candidates["Amount"]==amt]
                 if not cand.empty:
+                    cand = cand.copy()
                     cand["_diff"] = (cand["Date"] - s_date).dt.days.abs()
                     valid = cand[cand["_diff"] <= 3]
                     if not valid.empty:
                         best = valid.sort_values("_diff").index[0]
                         idx = valid.sort_values("_diff").index[0]
                         bank.at[idx, "is_matched"] = True
+                        # RENAMED: 'Multiple Matches (Check Date)' to 'Soft Match'
                         sap.at[i, "status"] = "Soft Match" 
                         sap.at[i, "Match_Method"] = f"Date Diff {valid.loc[best, '_diff']} days"
+                        # NEW: Capture Bank Reference
                         if self.orig_bank_ref_col:
                             sap.at[i, f"Bank_{self.orig_bank_ref_col}"] = bank.loc[idx, self.orig_bank_ref_col]
-                        # NEW: Capture Bank Narration
-                        if self.orig_bank_narration_col:
-                            sap.at[i, f"Bank_{self.orig_bank_narration_col}"] = bank.loc[idx, self.orig_bank_narration_col]
                         continue
 
             # PASS 4: Amount Only
-            # Filter candidates by amount and direction first
             cand = bank_candidates[bank_candidates["Amount"]==amt]
             if not cand.empty:
                 idx = cand.index[0]
                 bank.at[idx, "is_matched"] = True
                 sap.at[i, "status"] = "Matched (Amount Only)" 
                 sap.at[i, "Match_Method"] = "Amount Only"
+                # NEW: Capture Bank Reference
                 if self.orig_bank_ref_col:
                     sap.at[i, f"Bank_{self.orig_bank_ref_col}"] = bank.loc[idx, self.orig_bank_ref_col]
-                # NEW: Capture Bank Narration
-                if self.orig_bank_narration_col:
-                    sap.at[i, f"Bank_{self.orig_bank_narration_col}"] = bank.loc[idx, self.orig_bank_narration_col]
 
         # Handle Leftovers (Bank Only)
         unmatched = bank[bank["is_matched"]==False].copy()
@@ -520,63 +484,59 @@ class Processor:
                 "status": "Not Found in SAP Record", 
                 "Match_Method": "Bank Only"
             })
+            # --- DATE MAPPING FIX: Map Bank 'Date' to SAP Date column name for sorting ---
+            target_date_col = self.sap_date_col if (self.sap_date_col and self.sap_date_col in sap.columns) else "Date"
             
-            # --- Capture required columns for Bank Only records ---
-            # Date (for bank)
             if self.bank_date_col and "Date" in unmatched.columns:
-                 extra[self.sap_date_name or "Date"] = unmatched["Date"] # Use SAP date col name for consistency
+                 extra[target_date_col] = unmatched["Date"]
             
-            # SAP Ref column (empty)
+            # NEW: If SAP Ref exists, add its column to the "Bank Only" records, and populate it with the Bank Ref
             if self.orig_sap_ref_col:
-                 extra[self.orig_sap_ref_col] = np.nan 
+                 extra[self.orig_sap_ref_col] = np.nan # SAP ref is empty for bank only records
             
-            # Bank Ref column (populated)
-            if self.orig_bank_ref_col and self.orig_bank_ref_col in unmatched.columns: 
+            # NEW: Add Bank Ref column to "Bank Only" records, populated with Bank Ref
+            if self.orig_bank_ref_col: 
                  extra[f"Bank_{self.orig_bank_ref_col}"] = unmatched[self.orig_bank_ref_col]
-
-            # NEW: Bank Narration column (populated)
-            if self.orig_bank_narration_col and self.orig_bank_narration_col in unmatched.columns: 
-                 extra[f"Bank_{self.orig_bank_narration_col}"] = unmatched[self.orig_bank_narration_col]
             
-            # SAP Debit/Credit Type
-            if self.sap_type_col:
-                # SAP Credit ('H') corresponds to Bank Dr (Outgoing)
-                # SAP Debit ('S') corresponds to Bank Cr (Incoming)
-                extra[self.sap_type_col] = np.where(unmatched['Txn_Type'] == 'Dr', 'H', 'S')
-
             sap = pd.concat([sap, extra], ignore_index=True)
             
         if "_clean_ref" in sap.columns: sap.drop(columns=["_clean_ref"], inplace=True)
         self.final = sap
         
-        # --- FINAL COLUMN REORDERING FOR READABILITY (Date to the far left) ---
+        # FINAL COLUMN REORDERING FOR READABILITY
         final_cols = list(self.final.columns)
         
-        # 1. Date (Shifted to the far left)
-        date_col_name = self.sap_date_name if self.sap_date_name else self.sap_date_col if self.sap_date_col else "Date" 
+        # Prioritize Amount and Status near the start
+        priority_cols = [col_amt, "status", "Match_Method"]
         
-        # 2. Key matching/status columns
-        priority_cols = [col_amt, "status", "Match_Method", self.sap_type_col]
-        
-        # 3. Reference Columns (Side by Side)
-        ref_cols = []
-        if self.orig_sap_ref_col: ref_cols.append(self.orig_sap_ref_col)
-        if self.orig_bank_ref_col: ref_cols.append(f"Bank_{self.orig_bank_ref_col}")
-        # NEW: Include Bank Narration column here
-        if self.orig_bank_narration_col and f"Bank_{self.orig_bank_narration_col}" in self.final.columns: 
-            ref_cols.append(f"Bank_{self.orig_bank_narration_col}")
-        
-        # Remove priority/ref columns from the rest of the list
-        for col in [date_col_name] + priority_cols + ref_cols:
+        # Include original SAP and Bank Reference columns
+        if self.orig_sap_ref_col: priority_cols.insert(1, self.orig_sap_ref_col)
+        if self.orig_bank_ref_col: priority_cols.insert(2, f"Bank_{self.orig_bank_ref_col}")
+
+        # Remove priority columns from the rest of the list
+        for col in priority_cols:
             if col in final_cols: final_cols.remove(col)
         
         # Combine and apply new column order
-        new_order = [date_col_name] + priority_cols + ref_cols + final_cols
+        new_order = priority_cols + final_cols
         
         # Remove any duplicates or non-existent columns from the final order list
         final_order = [c for c in new_order if c in self.final.columns]
         
         self.final = self.final[final_order]
+
+        # --- UPDATE: SORT DATE SERIAL WISE & ADD SERIAL NO ---
+        
+        # 1. Sort by Date
+        sort_date_col = self.sap_date_col if (self.sap_date_col and self.sap_date_col in self.final.columns) else "Date"
+        if sort_date_col in self.final.columns:
+            # Ensure it's datetime
+            self.final[sort_date_col] = pd.to_datetime(self.final[sort_date_col], errors='coerce')
+            self.final.sort_values(by=sort_date_col, ascending=True, inplace=True, na_position='last')
+        
+        # 2. Add Serial Number (S.No.) at the Start for user friendliness
+        self.final.reset_index(drop=True, inplace=True)
+        self.final.insert(0, "S.No.", self.final.index + 1)
 
 
     def excel(self):
@@ -601,7 +561,7 @@ class Processor:
                 for r in range(2, ws.max_row + 1):
                     val = str(ws.cell(r, col_idx).value or "").lower()
                     if "100%" in val: ws.cell(r, col_idx).fill = green
-                    # Check for 'soft match'
+                    # NEW: Check for 'soft match'
                     elif "soft match" in val: ws.cell(r, col_idx).fill = orange
                     elif "amount only" in val: ws.cell(r, col_idx).fill = blue_light
                     elif "bank" in val: ws.cell(r, col_idx).fill = red
@@ -612,9 +572,9 @@ class Processor:
             s_ws["A1"] = "RECONCILIATION SUMMARY"; s_ws["A1"].font = Font(bold=True, size=14)
             s_ws["A3"] = f"Total Records: {len(self.final)}"
             
-            # Update summary logic for 'Soft Match'
+            # NEW: Update summary logic for 'Soft Match'
             df_exact = self.final[self.final["status"] == "100% Matched"]
-            df_soft = self.final[self.final["status"] == "Soft Match"] 
+            df_soft = self.final[self.final["status"] == "Soft Match"] # Use 'Soft Match'
             df_amount = self.final[self.final["status"].str.contains("Amount Only", na=False)]
             df_unmatched = self.final[self.final["status"].str.contains("Not Found", na=False)]
             
@@ -685,6 +645,7 @@ with col_results:
                         st.session_state.excel_buffer = p.excel()
                         st.session_state.metrics = {
                             "matched": (p.final["status"] == "100% Matched").sum(),
+                            # NEW: Use 'Soft Match' for metrics
                             "soft": (p.final["status"] == "Soft Match").sum(),
                             "amount_only": (p.final["status"].str.contains("Amount Only")).sum(),
                             "notfound": (p.final["status"].str.contains("Not Found")).sum()
@@ -692,7 +653,7 @@ with col_results:
                         st.rerun()
                 except Exception as e:
                     st.error(f"⚠️ Error: {str(e)}")
-                    st.info("Tip: Ensure you selected the correct Sheet (not the Summary sheet) and your SAP file contains a Debit/Credit Indicator column.")
+                    st.info("Tip: Ensure you selected the correct Sheet (not the Summary sheet).")
         
         st.markdown("""
         <div class="empty-state">
@@ -707,9 +668,9 @@ with col_results:
         
         # --- ADDED HELP TOOLTIPS HERE ---
         c1.metric("✅ Exact", m["matched"], help="Perfect match found using Reference ID OR (Exact Date + Amount).")
-        c2.metric("🟠 Soft Date", m["soft"], help="Amount and Direction match, but Date differs by up to ±3 days.")
-        c3.metric("🔵 Amount Only", m["amount_only"], help="Amount and Direction match exactly, but Date differs by more than 3 days (or Date missing).")
-        c4.metric("❌ Unmatched", m["notfound"], help="SAP transaction could not be found in the Bank Statement OR Bank transaction could not be found in SAP.")
+        c2.metric("🟠 Soft Date", m["soft"], help="Amount matches, but Date differs by up to ±3 days.")
+        c3.metric("🔵 Amount Only", m["amount_only"], help="Amount matches exactly, but Date differs by more than 3 days (or Date missing).")
+        c4.metric("❌ Unmatched", m["notfound"], help="SAP transaction could not be found in the Bank Statement.")
         
         st.divider()
         st.markdown("#### 📊 Data Preview")
