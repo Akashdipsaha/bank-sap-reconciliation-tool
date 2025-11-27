@@ -184,6 +184,9 @@ class Processor:
         self.bank_ref_col = None
         self.sap_ref_col = None
         self.sap_type_col = None
+        # NEW: Store original reference column names for final output
+        self.orig_bank_ref_col = None 
+        self.orig_sap_ref_col = None
 
     def clean_currency(self, series):
         if series.dtype == 'object':
@@ -258,6 +261,8 @@ class Processor:
         for col, lower_col in col_map.items():
             if any(k in lower_col for k in ref_keywords):
                 self.bank_ref_col = col
+                # Store original Bank ref column name
+                self.orig_bank_ref_col = col 
                 break
 
         # --- 3. IDENTIFY AMOUNT & TYPE (THE FIX) ---
@@ -367,6 +372,8 @@ class Processor:
         for c in self.df2.columns:
             if c.lower() in ["assignment", "reference", "ref key", "text"]:
                 self.sap_ref_col = c
+                # Store original SAP ref column name
+                self.orig_sap_ref_col = c
                 break
         
         # Find SAP Debit/Credit
@@ -380,6 +387,11 @@ class Processor:
         sap["status"] = "Not Found in Bank Statement"
         sap["Match_Method"] = ""
         bank["is_matched"] = False
+        
+        # NEW: Create a new column in SAP to hold the matching Bank Reference
+        # Ensure Bank Reference column exists before attempting to access
+        if self.orig_bank_ref_col and self.orig_bank_ref_col in bank.columns:
+            sap[f"Bank_{self.orig_bank_ref_col}"] = np.nan 
 
         if self.sap_ref_col and self.bank_ref_col:
             sap["_clean_ref"] = self.clean_ref(sap[self.sap_ref_col])
@@ -414,6 +426,9 @@ class Processor:
                         bank.at[idx, "is_matched"] = True
                         sap.at[i, "status"] = "100% Matched"
                         sap.at[i, "Match_Method"] = "Ref ID"
+                        # NEW: Capture Bank Reference
+                        if self.orig_bank_ref_col:
+                            sap.at[i, f"Bank_{self.orig_bank_ref_col}"] = bank.loc[idx, self.orig_bank_ref_col]
                         continue
 
             # PASS 2: Exact Date
@@ -425,6 +440,9 @@ class Processor:
                     bank.at[idx, "is_matched"] = True
                     sap.at[i, "status"] = "100% Matched"
                     sap.at[i, "Match_Method"] = "Exact Date"
+                    # NEW: Capture Bank Reference
+                    if self.orig_bank_ref_col:
+                        sap.at[i, f"Bank_{self.orig_bank_ref_col}"] = bank.loc[idx, self.orig_bank_ref_col]
                     continue
 
             # PASS 3: Soft Date
@@ -437,9 +455,14 @@ class Processor:
                     valid = cand[cand["_diff"] <= 3]
                     if not valid.empty:
                         best = valid.sort_values("_diff").index[0]
-                        bank.at[best, "is_matched"] = True
-                        sap.at[i, "status"] = "Multiple Matches (Check Date)" 
+                        idx = valid.sort_values("_diff").index[0]
+                        bank.at[idx, "is_matched"] = True
+                        # RENAMED: 'Multiple Matches (Check Date)' to 'Soft Match'
+                        sap.at[i, "status"] = "Soft Match" 
                         sap.at[i, "Match_Method"] = f"Date Diff {valid.loc[best, '_diff']} days"
+                        # NEW: Capture Bank Reference
+                        if self.orig_bank_ref_col:
+                            sap.at[i, f"Bank_{self.orig_bank_ref_col}"] = bank.loc[idx, self.orig_bank_ref_col]
                         continue
 
             # PASS 4: Amount Only
@@ -449,8 +472,11 @@ class Processor:
                 bank.at[idx, "is_matched"] = True
                 sap.at[i, "status"] = "Matched (Amount Only)" 
                 sap.at[i, "Match_Method"] = "Amount Only"
+                # NEW: Capture Bank Reference
+                if self.orig_bank_ref_col:
+                    sap.at[i, f"Bank_{self.orig_bank_ref_col}"] = bank.loc[idx, self.orig_bank_ref_col]
 
-        # Handle Leftovers
+        # Handle Leftovers (Bank Only)
         unmatched = bank[bank["is_matched"]==False].copy()
         if not unmatched.empty:
             extra = pd.DataFrame({
@@ -460,13 +486,42 @@ class Processor:
             })
             if self.bank_date_col and "Date" in unmatched.columns:
                  extra["Date"] = unmatched["Date"]
-            if self.bank_ref_col and self.sap_ref_col: 
-                 extra[self.sap_ref_col] = unmatched[self.bank_ref_col]
+            
+            # NEW: If SAP Ref exists, add its column to the "Bank Only" records, and populate it with the Bank Ref
+            if self.orig_sap_ref_col:
+                 extra[self.orig_sap_ref_col] = np.nan # SAP ref is empty for bank only records
+            
+            # NEW: Add Bank Ref column to "Bank Only" records, populated with Bank Ref
+            if self.orig_bank_ref_col: 
+                 extra[f"Bank_{self.orig_bank_ref_col}"] = unmatched[self.orig_bank_ref_col]
             
             sap = pd.concat([sap, extra], ignore_index=True)
             
         if "_clean_ref" in sap.columns: sap.drop(columns=["_clean_ref"], inplace=True)
         self.final = sap
+        
+        # FINAL COLUMN REORDERING FOR READABILITY
+        final_cols = list(self.final.columns)
+        
+        # Prioritize Amount and Status near the start
+        priority_cols = [col_amt, "status", "Match_Method"]
+        
+        # Include original SAP and Bank Reference columns
+        if self.orig_sap_ref_col: priority_cols.insert(1, self.orig_sap_ref_col)
+        if self.orig_bank_ref_col: priority_cols.insert(2, f"Bank_{self.orig_bank_ref_col}")
+
+        # Remove priority columns from the rest of the list
+        for col in priority_cols:
+            if col in final_cols: final_cols.remove(col)
+        
+        # Combine and apply new column order
+        new_order = priority_cols + final_cols
+        
+        # Remove any duplicates or non-existent columns from the final order list
+        final_order = [c for c in new_order if c in self.final.columns]
+        
+        self.final = self.final[final_order]
+
 
     def excel(self):
         buf = BytesIO()
@@ -490,7 +545,8 @@ class Processor:
                 for r in range(2, ws.max_row + 1):
                     val = str(ws.cell(r, col_idx).value or "").lower()
                     if "100%" in val: ws.cell(r, col_idx).fill = green
-                    elif "multiple" in val: ws.cell(r, col_idx).fill = orange
+                    # NEW: Check for 'soft match'
+                    elif "soft match" in val: ws.cell(r, col_idx).fill = orange
                     elif "amount only" in val: ws.cell(r, col_idx).fill = blue_light
                     elif "bank" in val: ws.cell(r, col_idx).fill = red
                     elif "sap" in val: ws.cell(r, col_idx).fill = yellow
@@ -499,17 +555,19 @@ class Processor:
             s_ws = writer.book.create_sheet("Summary")
             s_ws["A1"] = "RECONCILIATION SUMMARY"; s_ws["A1"].font = Font(bold=True, size=14)
             s_ws["A3"] = f"Total Records: {len(self.final)}"
-            s_ws["A4"] = f"Exact Matches: {(self.final['status'] == '100% Matched').sum()}"
-            s_ws["A5"] = f"Soft Date Matches: {(self.final['status'].str.contains('Multiple')).sum()}"
-            s_ws["A6"] = f"Amount Only Matches (Pass 4): {(self.final['status'].str.contains('Amount Only')).sum()}"
-            s_ws["A7"] = f"Unreconciled: {(self.final['status'].str.contains('Not Found')).sum()}"
-
-            # SHEETS
+            
+            # NEW: Update summary logic for 'Soft Match'
             df_exact = self.final[self.final["status"] == "100% Matched"]
-            df_soft = self.final[self.final["status"].str.contains("Multiple", na=False)]
+            df_soft = self.final[self.final["status"] == "Soft Match"] # Use 'Soft Match'
             df_amount = self.final[self.final["status"].str.contains("Amount Only", na=False)]
             df_unmatched = self.final[self.final["status"].str.contains("Not Found", na=False)]
+            
+            s_ws["A4"] = f"Exact Matches: {len(df_exact)}"
+            s_ws["A5"] = f"Soft Date Matches: {len(df_soft)}"
+            s_ws["A6"] = f"Amount Only Matches (Pass 4): {len(df_amount)}"
+            s_ws["A7"] = f"Unreconciled: {len(df_unmatched)}"
 
+            # SHEETS (Ensure sheet names and data match new status names)
             if not df_exact.empty: df_exact.to_excel(writer, index=False, sheet_name="Exact Matches")
             if not df_soft.empty: df_soft.to_excel(writer, index=False, sheet_name="Soft Matches")
             if not df_amount.empty: df_amount.to_excel(writer, index=False, sheet_name="Amount Only Matches")
@@ -571,7 +629,8 @@ with col_results:
                         st.session_state.excel_buffer = p.excel()
                         st.session_state.metrics = {
                             "matched": (p.final["status"] == "100% Matched").sum(),
-                            "soft": (p.final["status"].str.contains("Multiple")).sum(),
+                            # NEW: Use 'Soft Match' for metrics
+                            "soft": (p.final["status"] == "Soft Match").sum(),
                             "amount_only": (p.final["status"].str.contains("Amount Only")).sum(),
                             "notfound": (p.final["status"].str.contains("Not Found")).sum()
                         }
