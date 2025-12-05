@@ -171,22 +171,21 @@ st.markdown("""
 st.sidebar.header("⚙️ Configuration")
 acct_type = st.sidebar.selectbox("Account Type", ["G/L Account", "BRS Account"], index=1)
 st.sidebar.markdown("---")
-st.sidebar.info("Fixed: Automatically detects formats like 'Tran Date', 'Dr Amount', 'Withdrawals'.")
 
 # ----------------------------------------------------
-# 5. Processor Class (FIXED COLUMN MAPPING)
+# 5. Processor Class (UPDATED FOR KZ->ZR & HISTORY)
 # ----------------------------------------------------
 class Processor:
-    def __init__(self, b, s, a):
-        self.b, self.s, self.a = b, s, a
+    def __init__(self, b, s, h, a):
+        self.b, self.s, self.h, self.a = b, s, h, a
         self.bank_date_col = None
         self.sap_date_col = None
         self.bank_ref_col = None
         self.sap_ref_col = None
         self.sap_type_col = None
-        # NEW: Store original reference column names for final output
         self.orig_bank_ref_col = None 
         self.orig_sap_ref_col = None
+        self.df_history = None
 
     def clean_currency(self, series):
         if series.dtype == 'object':
@@ -199,15 +198,11 @@ class Processor:
 
     def _prep(self, df):
         if df.empty: return pd.DataFrame()
-        
-        # --- 1. ROBUST HEADER DETECTION ---
-        # Scan up to 25 rows. Look for "Date" + "Amount" OR "Date" + "Dr/Cr"
         header_idx = None
         scan_limit = min(25, len(df))
         
         for i in range(scan_limit):
             row_vals = df.iloc[i].astype(str).str.lower()
-            # Keywords to identify a header row
             has_date = any(x in row_vals.values for x in ["date", "txn date", "transaction date", "val. date", "posting date", "tran date"])
             has_amt = any(x in row_vals.values for x in ["amount", "debit", "credit", "withdrawal", "deposit", "withdrawals", "deposits", "amount(inr)", "dr amount", "cr amount", "dr/cr", "dr", "cr"])
             
@@ -216,29 +211,22 @@ class Processor:
                 break
         
         if header_idx is None: 
-            # Fallback: Try just Finding "Date" (Risky but necessary for some files)
             for i in range(scan_limit):
                 row_vals = df.iloc[i].astype(str).str.lower()
                 if any(x in row_vals.values for x in ["date", "txn date", "transaction date", "tran date"]):
                     header_idx = i; break
 
         if header_idx is None:
-            # Fallback 2: Heuristic for Headless Data (Sheet1 case)
-            # Check if Column 0 is Date-like and Column with 'CR'/'DR' exists
             try:
                 first_cell = pd.to_datetime(df.iloc[0, 0], dayfirst=True, errors='coerce')
                 if not pd.isna(first_cell):
                     pass 
             except:
                 pass
-            return pd.DataFrame() # Return empty if no header found
-        
-        # Apply Header
+            return pd.DataFrame() 
         df.columns = df.iloc[header_idx]
         df = df[header_idx+1:]
         
-        # Clean Column Names (Remove newlines, spaces, parens, lower case for matching)
-        # Handle duplicate columns by deduplicating
         cols = pd.Series([str(c).strip() for c in df.columns])
         for dup in cols[cols.duplicated()].unique(): 
             cols[cols[cols == dup].index.values.tolist()] = [dup + '.' + str(i) if i != 0 else dup for i in range(sum(cols == dup))]
@@ -247,107 +235,119 @@ class Processor:
         col_map = {c: c.lower().replace('\n', ' ').replace('(', '').replace(')', '').strip() for c in df.columns}
         
         # --- 2. IDENTIFY COLUMNS (FLEXIBLE) ---
-        
-        # Date
         date_keywords = ["date", "txn date", "transaction date", "val. date", "tran date"]
         for col, lower_col in col_map.items():
             if any(k == lower_col for k in date_keywords) or (("date" in lower_col) and ("value" not in lower_col) and ("doc" not in lower_col)):
-                self.bank_date_col = "Date" # We will rename it to this
+                self.bank_date_col = "Date"
                 df.rename(columns={col: "Date"}, inplace=True)
                 break
         
-        # Reference
         ref_keywords = ["chq./ref.no.", "cheque no", "ref no", "reference", "narration", "description", "tran id", "remarks", "chqno", "particulars"]
         for col, lower_col in col_map.items():
             if any(k in lower_col for k in ref_keywords):
                 self.bank_ref_col = col
-                # Store original Bank ref column name
                 self.orig_bank_ref_col = col 
                 break
 
-        # --- 3. IDENTIFY AMOUNT & TYPE (THE FIX) ---
+        # --- 3. IDENTIFY AMOUNT & TYPE ---
+        w_col = None; d_col = None; amt_col = None; type_col = None
         
-        w_col = None # Withdrawal / Debit
-        d_col = None # Deposit / Credit
-        amt_col = None # Generic Amount
-        type_col = None # Dr/Cr Indicator
-        
-        # Search for Split Columns
         for col, lower_col in col_map.items():
-            if "withdrawal" in lower_col or "debit" in lower_col or "dr amount" in lower_col:
-                w_col = col
-            if "deposit" in lower_col or "credit" in lower_col or "cr amount" in lower_col:
-                d_col = col
-            if "amount" in lower_col and "dr" not in lower_col and "cr" not in lower_col:
-                amt_col = col
-            if lower_col in ["dr/cr", "cr/dr", "type", "indicator", "d/c"]:
-                type_col = col
-
-        # --- LOGIC TO CREATE 'Amount' and 'Txn_Type' ---
+            if "withdrawal" in lower_col or "debit" in lower_col or "dr amount" in lower_col: w_col = col
+            if "deposit" in lower_col or "credit" in lower_col or "cr amount" in lower_col: d_col = col
+            if "amount" in lower_col and "dr" not in lower_col and "cr" not in lower_col: amt_col = col
+            if lower_col in ["dr/cr", "cr/dr", "type", "indicator", "d/c"]: type_col = col
         
-        # CASE A: Separate Debit and Credit Columns (e.g., Union Bank, SBI)
         if w_col and d_col:
             df[w_col] = self.clean_currency(df[w_col])
             df[d_col] = self.clean_currency(df[d_col])
-            
             df['Amount'] = df[w_col].fillna(0) + df[d_col].fillna(0)
-            # Determine Type: If Withdrawal > 0 -> Dr, else Cr
             df['Txn_Type'] = np.where(df[w_col].fillna(0) > 0, 'Dr', 'Cr')
-            
-        # CASE B: Single Amount Column + Indicator Column (e.g., Axis Bank, Kotak)
         elif amt_col and type_col:
             df['Amount'] = self.clean_currency(df[amt_col])
-            # Normalize Indicator (CR, Cr, cr -> Cr)
             df['Txn_Type'] = df[type_col].astype(str).str.upper().apply(lambda x: 'Cr' if 'CR' in x or 'C' == x else 'Dr')
-            
-        # CASE C: Ambiguous Single Column
         elif w_col and not d_col:
             df['Amount'] = self.clean_currency(df[w_col])
             df['Txn_Type'] = 'Dr'
-            
         elif amt_col:
-             # Just "Amount" found. Attempt to find hidden indicator in last column
              df['Amount'] = self.clean_currency(df[amt_col])
-             
              last_col = df.columns[-1]
-             # Check a sample of values in the last column to see if they look like CR/DR
              sample_series = df[last_col].astype(str).str.upper()
              if sample_series.str.contains('CR').any() or sample_series.str.contains('DR').any():
                  df['Txn_Type'] = sample_series.apply(lambda x: 'Cr' if 'CR' in x or 'C' == x else 'Dr')
              else:
-                 df['Txn_Type'] = 'Dr' # Fail-safe assumption
-
+                 df['Txn_Type'] = 'Dr' 
         else:
-            return pd.DataFrame() # No Amount found, skip
+            return pd.DataFrame() 
 
-        # Clean Up
-        df = df[df['Amount'] > 0] # Filter zero rows
+        df = df[df['Amount'] > 0]
         if self.bank_date_col == "Date" and "Date" in df.columns:
             df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors='coerce')
-        
-        # Ensure Txn_Type exists (Fail-safe)
-        if 'Txn_Type' not in df.columns:
-            df['Txn_Type'] = 'Dr'
+        if 'Txn_Type' not in df.columns: df['Txn_Type'] = 'Dr'
 
+        df['Direction'] = df['Txn_Type'].map({'Dr': 'Outgoing', 'Cr': 'Incoming'})
         return df
 
+    def preprocess_sap_kz_zr(self, df):
+        """
+        Enhances ZR rows with data from KZ rows using Clearing Document matching.
+        Then filters to keep ONLY ZR rows.
+        """
+        # Identify critical columns (flexible search)
+        col_map = {c: c.lower().strip() for c in df.columns}
+        doc_type_col = next((c for c, l in col_map.items() if 'document type' in l), None)
+        clear_doc_col = next((c for c, l in col_map.items() if 'clearing' in l and 'doc' in l), None)
+        text_col = next((c for c, l in col_map.items() if 'text' in l), None)
+        
+        # If we can't find Document Type, we can't distinguish KZ/ZR, so return as is
+        if not doc_type_col:
+            return df
+
+        # If we have Clearing Document, use it for robust mapping
+        if clear_doc_col and text_col:
+            # Create a map: Clearing Document -> Text (from KZ rows)
+            kz_rows = df[df[doc_type_col].astype(str).str.upper() == 'KZ']
+            # We take the first valid text found for a clearing doc
+            kz_map = kz_rows.set_index(clear_doc_col)[text_col].to_dict()
+            
+            # Apply to ZR rows
+            is_zr = df[doc_type_col].astype(str).str.upper() == 'ZR'
+            
+            # Function to apply mapping: If existing text is empty/generic, try to fetch from KZ
+            def apply_map(row):
+                val = row[clear_doc_col]
+                if val in kz_map:
+                    return kz_map[val] # Use KZ name
+                return row[text_col] # Keep existing if no KZ match
+
+            df.loc[is_zr, text_col] = df.loc[is_zr].apply(apply_map, axis=1)
+
+        # Filter: "I am only considering the ZR from here"
+        # We also keep rows that might not have a doc type just in case, but usually we filter strict.
+        # Based on user request, strict ZR filter.
+        df_filtered = df[df[doc_type_col].astype(str).str.upper() == 'ZR'].copy()
+        
+        return df_filtered
+
     def load_files(self, sheet_name=None):
-        # Load Bank
+        # 1. Load Bank
         if self.b.name.endswith('.csv'): 
             b_df = pd.read_csv(self.b)
         else: 
             b_df = pd.read_excel(self.b, header=None, sheet_name=sheet_name)
         
         self.df = self._prep(b_df)
-        
         if self.df.empty:
-            raise ValueError("Could not detect valid bank transactions. Please check if you selected a Summary sheet instead of the Data sheet.")
+            raise ValueError("Could not detect valid bank transactions.")
 
-        # Load SAP
+        # 2. Load SAP
         if self.s.name.endswith('.csv'): 
             self.df2 = pd.read_csv(self.s)
         else: 
             self.df2 = pd.read_excel(self.s)
+        
+        # --- PREPROCESS SAP: KZ -> ZR MAPPING ---
+        self.df2 = self.preprocess_sap_kz_zr(self.df2)
         
         # Prepare SAP Columns
         col = "Amount in LC" if self.a == "BRS Account" else "Amount in Local Currency"
@@ -361,23 +361,39 @@ class Processor:
         
         self.df2[col] = self.clean_currency(self.df2[col])
         
-        # Find SAP Date
         for c in self.df2.columns:
             if "date" in c.lower() and "doc" not in c.lower(): 
                 self.sap_date_col = c
                 self.df2[c] = pd.to_datetime(self.df2[c], dayfirst=True, errors='coerce')
                 break
 
-        # Find SAP Ref
         for c in self.df2.columns:
             if c.lower() in ["assignment", "reference", "ref key", "text"]:
                 self.sap_ref_col = c
-                # Store original SAP ref column name
                 self.orig_sap_ref_col = c
                 break
         
-        # Find SAP Debit/Credit
         self.sap_type_col = next((c for c in self.df2.columns if "debit" in c.lower() and "credit" in c.lower()), None)
+
+        # 3. Load History (Already Cleared) File
+        if self.h is not None:
+            if self.h.name.endswith('.csv'):
+                self.df_history = pd.read_csv(self.h)
+            else:
+                self.df_history = pd.read_excel(self.h)
+            
+            # Clean History Amount
+            h_col = "Amount in LC" if self.a == "BRS Account" else "Amount in Local Currency" # Guessing same format
+            # Fallback search for amount in history
+            if h_col not in self.df_history.columns:
+                for c in self.df_history.columns:
+                     if "amount" in c.lower():
+                         h_col = c; break
+            
+            if h_col in self.df_history.columns:
+                self.df_history["_Amount"] = self.clean_currency(self.df_history[h_col])
+            else:
+                self.df_history = None # Invalid history file
 
     def match(self):
         bank = self.df.copy().reset_index(drop=True)
@@ -387,9 +403,8 @@ class Processor:
         sap["status"] = "Not Found in Bank Statement"
         sap["Match_Method"] = ""
         bank["is_matched"] = False
+        sap["Direction"] = "" 
         
-        # NEW: Create a new column in SAP to hold the matching Bank Reference
-        # Ensure Bank Reference column exists before attempting to access
         if self.orig_bank_ref_col and self.orig_bank_ref_col in bank.columns:
             sap[f"Bank_{self.orig_bank_ref_col}"] = np.nan 
 
@@ -397,17 +412,20 @@ class Processor:
             sap["_clean_ref"] = self.clean_ref(sap[self.sap_ref_col])
             bank["_clean_ref"] = self.clean_ref(bank[self.bank_ref_col])
 
-        # --- MATCHING LOOP ---
+        # --- MATCHING LOOP (SAP vs Bank) ---
         for i, row in sap.iterrows():
             amt = row[col_amt]
             if pd.isna(amt): continue
             
-            # Directional Logic
             target_type = None
             if self.sap_type_col:
                 sap_ind = str(row[self.sap_type_col]).strip().upper()
-                if sap_ind == 'H': target_type = 'Dr' # SAP Credit -> Bank Withdrawal
-                elif sap_ind == 'S': target_type = 'Cr' # SAP Debit -> Bank Deposit
+                if sap_ind == 'H': 
+                    target_type = 'Dr' # Outgoing
+                    sap.at[i, "Direction"] = "Outgoing"
+                elif sap_ind == 'S': 
+                    target_type = 'Cr' # Incoming
+                    sap.at[i, "Direction"] = "Incoming"
             
             if target_type:
                 bank_candidates = bank[(bank['Txn_Type'] == target_type) & (bank["is_matched"] == False)]
@@ -424,8 +442,14 @@ class Processor:
                     if not cand.empty:
                         idx = cand.index[0]
                         bank.at[idx, "is_matched"] = True
-                        sap.at[i, "status"] = "100% Matched"
-                        sap.at[i, "Match_Method"] = "Ref ID"
+                        sap.at[i, "status"] = "Matched"
+                        
+                        diff_text = ""
+                        if self.sap_date_col and not pd.isna(row[self.sap_date_col]):
+                             diff = (bank.loc[idx, "Date"] - row[self.sap_date_col]).days
+                             diff_text = f" (Diff: {diff} days)"
+                        
+                        sap.at[i, "Match_Method"] = f"Ref ID{diff_text}"
                         if self.orig_bank_ref_col:
                             sap.at[i, f"Bank_{self.orig_bank_ref_col}"] = bank.loc[idx, self.orig_bank_ref_col]
                         continue
@@ -437,8 +461,8 @@ class Processor:
                 if not cand.empty:
                     idx = cand.index[0]
                     bank.at[idx, "is_matched"] = True
-                    sap.at[i, "status"] = "100% Matched"
-                    sap.at[i, "Match_Method"] = "Exact Date"
+                    sap.at[i, "status"] = "Matched"
+                    sap.at[i, "Match_Method"] = "Exact Date (Diff: 0 days)"
                     if self.orig_bank_ref_col:
                         sap.at[i, f"Bank_{self.orig_bank_ref_col}"] = bank.loc[idx, self.orig_bank_ref_col]
                     continue
@@ -452,11 +476,11 @@ class Processor:
                     cand["_diff"] = (cand["Date"] - s_date).dt.days.abs()
                     valid = cand[cand["_diff"] <= 3]
                     if not valid.empty:
-                        best = valid.sort_values("_diff").index[0]
                         idx = valid.sort_values("_diff").index[0]
                         bank.at[idx, "is_matched"] = True
-                        sap.at[i, "status"] = "Soft Match" 
-                        sap.at[i, "Match_Method"] = f"Date Diff {valid.loc[best, '_diff']} days"
+                        sap.at[i, "status"] = "Matched" 
+                        diff_days = (bank.loc[idx, "Date"] - s_date).days
+                        sap.at[i, "Match_Method"] = f"Date Variance (Diff: {diff_days} days)"
                         if self.orig_bank_ref_col:
                             sap.at[i, f"Bank_{self.orig_bank_ref_col}"] = bank.loc[idx, self.orig_bank_ref_col]
                         continue
@@ -466,10 +490,29 @@ class Processor:
             if not cand.empty:
                 idx = cand.index[0]
                 bank.at[idx, "is_matched"] = True
-                sap.at[i, "status"] = "Matched (Amount Only)" 
-                sap.at[i, "Match_Method"] = "Amount Only"
+                sap.at[i, "status"] = "Matched" 
+                diff_text = "N/A"
+                if self.sap_date_col and not pd.isna(row[self.sap_date_col]) and not pd.isna(bank.loc[idx, "Date"]):
+                      d_val = (bank.loc[idx, "Date"] - row[self.sap_date_col]).days
+                      diff_text = f"{d_val} days"
+                sap.at[i, "Match_Method"] = f"Amount Only (Diff: {diff_text})"
                 if self.orig_bank_ref_col:
                     sap.at[i, f"Bank_{self.orig_bank_ref_col}"] = bank.loc[idx, self.orig_bank_ref_col]
+
+        # --- HISTORY CHECK FOR UNRECONCILED SAP ITEMS ---
+        if self.df_history is not None:
+             unmatched_indices = sap[sap["status"] == "Not Found in Bank Statement"].index
+             
+             for i in unmatched_indices:
+                 amt = sap.at[i, col_amt]
+                 # Look for this amount in history file
+                 # Simple check: Amount match. (Could be stricter with Ref if available)
+                 hist_cand = self.df_history[self.df_history["_Amount"] == amt]
+                 
+                 if not hist_cand.empty:
+                     # Mark as Already Cleared
+                     sap.at[i, "status"] = "Already Cleared"
+                     sap.at[i, "Match_Method"] = "Found in History/Cleared File"
 
         # Handle Leftovers (Bank Only)
         unmatched = bank[bank["is_matched"]==False].copy()
@@ -477,77 +520,40 @@ class Processor:
             extra = pd.DataFrame({
                 col_amt: unmatched["Amount"], 
                 "status": "Not Found in SAP Record", 
-                "Match_Method": "Bank Only"
+                "Match_Method": "Bank Only (No Match)",
+                "Direction": unmatched["Direction"],
             })
-            # Map Bank 'Date' to SAP Date column name
             target_date_col = self.sap_date_col if (self.sap_date_col and self.sap_date_col in sap.columns) else "Date"
-            
             if self.bank_date_col and "Date" in unmatched.columns:
                  extra[target_date_col] = unmatched["Date"]
-            
             if self.orig_sap_ref_col:
-                 extra[self.orig_sap_ref_col] = np.nan
-            
+                 extra[self.orig_sap_ref_col] = np.nan 
             if self.orig_bank_ref_col: 
                  extra[f"Bank_{self.orig_bank_ref_col}"] = unmatched[self.orig_bank_ref_col]
-            
             sap = pd.concat([sap, extra], ignore_index=True)
             
         if "_clean_ref" in sap.columns: sap.drop(columns=["_clean_ref"], inplace=True)
+        self.final = sap
         
-        # --- 1. SORTING & SERIAL NUMBERS (Before Reordering) ---
-        
-        # Identify Key Columns
-        date_col = self.sap_date_col if (self.sap_date_col and self.sap_date_col in sap.columns) else "Date"
-        type_col = self.sap_type_col if (self.sap_type_col and self.sap_type_col in sap.columns) else "Txn_Type"
-        
-        # Sort Chronologically
-        if date_col in sap.columns:
-            sap[date_col] = pd.to_datetime(sap[date_col], errors='coerce')
-            sap.sort_values(by=date_col, ascending=True, inplace=True, na_position='last')
-        
-        # Add S.No.
-        sap.reset_index(drop=True, inplace=True)
-        sap.insert(0, "S.No.", sap.index + 1)
-        
-        # --- 2. SPECIFIC COLUMN REORDERING ---
-        # Requirement: [S.No.] -> [Date] -> ... -> [Match_Method] -> [Credit/Debit]
-        
-        all_cols = list(sap.columns)
-        new_order = ["S.No."]
-        
-        # Add Date (Second Position)
-        if date_col in all_cols and date_col not in new_order:
-            new_order.append(date_col)
-            
-        # Add References and Amount (Logic: Keep them visible early on)
-        if self.orig_sap_ref_col and self.orig_sap_ref_col in all_cols and self.orig_sap_ref_col not in new_order:
-            new_order.append(self.orig_sap_ref_col)
-        
-        if self.orig_bank_ref_col:
-            bank_ref_key = f"Bank_{self.orig_bank_ref_col}"
-            if bank_ref_key in all_cols and bank_ref_key not in new_order:
-                 new_order.append(bank_ref_key)
-        
-        if col_amt in all_cols and col_amt not in new_order:
-            new_order.append(col_amt)
-            
-        if "status" in all_cols and "status" not in new_order:
-            new_order.append("status")
-            
-        # Add Match Method
-        if "Match_Method" in all_cols and "Match_Method" not in new_order:
-            new_order.append("Match_Method")
-            
-        # Add Credit/Debit (Immediately after Match_Method)
-        if type_col in all_cols and type_col not in new_order:
-            new_order.append(type_col)
-            
-        # Add Remaining Columns
-        remaining = [c for c in all_cols if c not in new_order]
-        new_order.extend(remaining)
-        
-        self.final = sap[new_order]
+        # FINAL COLUMN REORDERING
+        final_cols = list(self.final.columns)
+        priority_cols = [self.sap_date_col, col_amt, "status", "Direction", "Match_Method"]
+        if self.orig_sap_ref_col: priority_cols.insert(5, self.orig_sap_ref_col)
+        if self.orig_bank_ref_col: priority_cols.insert(6, f"Bank_{self.orig_bank_ref_col}")
+
+        for col in priority_cols:
+            if col in final_cols: final_cols.remove(col)
+        new_order = priority_cols + final_cols
+        final_order = [c for c in new_order if c in self.final.columns and c is not None]
+        self.final = self.final[final_order]
+
+        # Sort and S.No.
+        sort_date_col = self.sap_date_col if (self.sap_date_col and self.sap_date_col in self.final.columns) else "Date"
+        if sort_date_col in self.final.columns:
+            self.final[sort_date_col] = pd.to_datetime(self.final[sort_date_col], errors='coerce')
+            self.final.sort_values(by=sort_date_col, ascending=True, inplace=True, na_position='last')
+        self.final.reset_index(drop=True, inplace=True)
+        self.final.insert(0, "S.No.", self.final.index + 1)
 
     def excel(self):
         buf = BytesIO()
@@ -558,10 +564,9 @@ class Processor:
             ws = writer.sheets["Data"]
             
             green = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
-            orange = PatternFill(start_color="FFB347", end_color="FFB347", fill_type="solid")
             red = PatternFill(start_color="FF9999", end_color="FF9999", fill_type="solid")
             yellow = PatternFill(start_color="FFD580", end_color="FFD580", fill_type="solid")
-            blue_light = PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")
+            grey = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
 
             col_idx = None
             for i, cell in enumerate(ws[1], start=1):
@@ -570,31 +575,26 @@ class Processor:
             if col_idx:
                 for r in range(2, ws.max_row + 1):
                     val = str(ws.cell(r, col_idx).value or "").lower()
-                    if "100%" in val: ws.cell(r, col_idx).fill = green
-                    elif "soft match" in val: ws.cell(r, col_idx).fill = orange
-                    elif "amount only" in val: ws.cell(r, col_idx).fill = blue_light
+                    if "matched" in val: ws.cell(r, col_idx).fill = green
                     elif "bank" in val: ws.cell(r, col_idx).fill = red
                     elif "sap" in val: ws.cell(r, col_idx).fill = yellow
+                    elif "already" in val: ws.cell(r, col_idx).fill = grey
 
             # SUMMARY
             s_ws = writer.book.create_sheet("Summary")
             s_ws["A1"] = "RECONCILIATION SUMMARY"; s_ws["A1"].font = Font(bold=True, size=14)
             s_ws["A3"] = f"Total Records: {len(self.final)}"
             
-            df_exact = self.final[self.final["status"] == "100% Matched"]
-            df_soft = self.final[self.final["status"] == "Soft Match"]
-            df_amount = self.final[self.final["status"].str.contains("Amount Only", na=False)]
+            df_matched = self.final[self.final["status"] == "Matched"]
+            df_cleared = self.final[self.final["status"] == "Already Cleared"]
             df_unmatched = self.final[self.final["status"].str.contains("Not Found", na=False)]
             
-            s_ws["A4"] = f"Exact Matches: {len(df_exact)}"
-            s_ws["A5"] = f"Soft Date Matches: {len(df_soft)}"
-            s_ws["A6"] = f"Amount Only Matches (Pass 4): {len(df_amount)}"
-            s_ws["A7"] = f"Unreconciled: {len(df_unmatched)}"
+            s_ws["A4"] = f"Total Matched (Bank vs SAP): {len(df_matched)}"
+            s_ws["A5"] = f"Already Cleared (History): {len(df_cleared)}"
+            s_ws["A6"] = f"Unreconciled: {len(df_unmatched)}"
 
-            # SHEETS (Ensure sheet names and data match new status names)
-            if not df_exact.empty: df_exact.to_excel(writer, index=False, sheet_name="Exact Matches")
-            if not df_soft.empty: df_soft.to_excel(writer, index=False, sheet_name="Soft Matches")
-            if not df_amount.empty: df_amount.to_excel(writer, index=False, sheet_name="Amount Only Matches")
+            if not df_matched.empty: df_matched.to_excel(writer, index=False, sheet_name="Matched Records")
+            if not df_cleared.empty: df_cleared.to_excel(writer, index=False, sheet_name="Already Cleared")
             if not df_unmatched.empty: df_unmatched.to_excel(writer, index=False, sheet_name="Unreconciled")
 
             for sheet_name in writer.sheets:
@@ -616,6 +616,7 @@ col_inputs, col_results = st.columns([2, 8], gap="medium")
 selected_sheet = None
 bank_file = None
 sap_file = None
+history_file = None
 
 with col_inputs:
     st.markdown('<div class="upload-card"><div class="card-header">🏦 Bank Statement</div>', unsafe_allow_html=True)
@@ -630,8 +631,12 @@ with col_inputs:
             st.error(f"Error reading sheets: {e}")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown('<div class="upload-card"><div class="card-header">💼 SAP Statement</div>', unsafe_allow_html=True)
-    sap_file = st.file_uploader("Upload SAP File", type=["xlsx", "xls", "csv"], key="sap_up", label_visibility="collapsed")
+    st.markdown('<div class="upload-card"><div class="card-header">💼 SAP Statement </div>', unsafe_allow_html=True)
+    sap_file = st.file_uploader("Upload SAP File (KZ/ZR)", type=["xlsx", "xls", "csv"], key="sap_up", label_visibility="collapsed")
+    st.markdown("</div>", unsafe_allow_html=True)
+    
+    st.markdown('<div class="upload-card"><div class="card-header">📂 Already Cleared / History</div>', unsafe_allow_html=True)
+    history_file = st.file_uploader("Upload History File", type=["xlsx", "xls", "csv"], key="hist_up", label_visibility="collapsed")
     st.markdown("</div>", unsafe_allow_html=True)
 
 with col_results:
@@ -645,17 +650,20 @@ with col_results:
                 try:
                     with st.spinner("🔄 Analyzing and Matching Data..."):
                         bank_file.seek(0); sap_file.seek(0)
-                        p = Processor(bank_file, sap_file, acct_type)
+                        if history_file: history_file.seek(0)
+                        
+                        p = Processor(bank_file, sap_file, history_file, acct_type)
                         p.load_files(selected_sheet)
                         p.match()
                         
                         st.session_state.processed_data = p.final
                         st.session_state.excel_buffer = p.excel()
+                        
                         st.session_state.metrics = {
-                            "matched": (p.final["status"] == "100% Matched").sum(),
-                            "soft": (p.final["status"] == "Soft Match").sum(),
-                            "amount_only": (p.final["status"].str.contains("Amount Only")).sum(),
-                            "notfound": (p.final["status"].str.contains("Not Found")).sum()
+                            "matched": (p.final["status"] == "Matched").sum(),
+                            "cleared": (p.final["status"] == "Already Cleared").sum(),
+                            "not_bank": (p.final["status"].str.contains("Not Found in Bank")).sum(),
+                            "not_sap": (p.final["status"].str.contains("Not Found in SAP")).sum()
                         }
                         st.rerun()
                 except Exception as e:
@@ -665,7 +673,7 @@ with col_results:
         st.markdown("""
         <div class="empty-state">
             <h3>👋 Ready to Reconcile?</h3>
-            <p>Upload your files on the left, select the correct sheet, and click "Start Matching Process".</p>
+            <p>Upload your files (Bank, SAP, and optional History) on the left, select the correct sheet, and click "Start Matching Process".</p>
         </div>
         """, unsafe_allow_html=True)
 
@@ -673,10 +681,10 @@ with col_results:
         m = st.session_state.metrics
         c1, c2, c3, c4 = st.columns(4)
         
-        c1.metric("✅ Exact", m["matched"], help="Perfect match found using Reference ID OR (Exact Date + Amount).")
-        c2.metric("🟠 Soft Date", m["soft"], help="Amount matches, but Date differs by up to ±3 days.")
-        c3.metric("🔵 Amount Only", m["amount_only"], help="Amount matches exactly, but Date differs by more than 3 days (or Date missing).")
-        c4.metric("❌ Unmatched", m["notfound"], help="SAP transaction could not be found in the Bank Statement.")
+        c1.metric("✅ Total Matched", m["matched"], help="Includes Exact, Date Variance, and Amount Only matches.")
+        c2.metric("📁 Already Cleared", m["cleared"], help="Found in the History/Previously Cleared file.")
+        c3.metric("🟥 Not in Bank", m["not_bank"], help="SAP entry exists but no matching Bank entry found.")
+        c4.metric("🟨 Not in SAP", m["not_sap"], help="Bank entry exists but no matching SAP entry found.")
         
         st.divider()
         st.markdown("#### 📊 Data Preview")
@@ -692,7 +700,8 @@ with col_results:
         
         st.markdown("""
         <div class="legend-box">
-        <b>Legend:</b> 🟩 Matched &nbsp;&nbsp; 🟧 Soft Match &nbsp;&nbsp; 🟦 Amount Only &nbsp;&nbsp; 🟥 Not in Bank &nbsp;&nbsp; 🟨 Not in SAP
+        <b>Legend:</b> 🟩 Matched &nbsp;&nbsp; ⬜ Already Cleared &nbsp;&nbsp; 🟥 Not in Bank &nbsp;&nbsp; 🟨 Not in SAP <br>
+        <i>Note: Match details (days difference) are in the 'Match_Method' column.</i>
         </div>
         """, unsafe_allow_html=True)
         
